@@ -1,48 +1,84 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
+	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"github.com/reference-kubernetes-controller/pkg/controller"
+	"github.com/reference-kubernetes-controller/pkg/signals"
+
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/klog/v2"
 )
 
-// createClientset creates and returns a Kubernetes clientset
-func createClientSet() *kubernetes.Clientset {
-	// Get home directory for kubeconfig path
+func main() {
+	klog.InitFlags(nil)
+
 	home, err := os.UserHomeDir()
 	if err != nil {
-		log.Fatalf("Failed to get home directory: %v", err)
+		klog.Fatalf("Failed to get home directory: %v", err)
 	}
-	// Parse kubeconfig flag to get the path to kubeconfig file
+
 	kubeconfig := flag.String("kubeconfig", filepath.Join(home, "/.kube/config"), "location of kubeconfig file")
 	flag.Parse()
-	// Build config from kubeconfig file
-	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
+
+	// Set up signals so we handle the shutdown signal gracefully
+	stopCh := signals.SetupSignalHandler()
+
+	config, err := buildConfig(*kubeconfig)
 	if err != nil {
-		log.Fatalf("Failed to build config: %v", err)
+		klog.Fatalf("Failed to build config: %v", err)
 	}
-	// Create clientset from the config
+
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		log.Fatalf("Failed to create clientset: %v", err)
+		klog.Fatalf("Failed to create clientset: %v", err)
 	}
-	return clientset
+
+	// Single shared factory
+	factory := informers.NewSharedInformerFactory(clientset, time.Second*30)
+
+	// Create controllers with workqueues
+	podController := controller.NewPodController(clientset, factory)
+	deploymentController := controller.NewDeploymentController(clientset, factory)
+
+	// Start all informers
+	factory.Start(stopCh)
+
+	// Wait for cache sync
+	if !cache.WaitForCacheSync(stopCh,
+		podController.HasSynced(),
+		deploymentController.HasSynced()) {
+		klog.Fatal("Failed to wait for cache sync")
+	}
+
+	// Start controllers
+	go podController.Run(2, stopCh)        // 2 workers
+	go deploymentController.Run(1, stopCh) // 1 worker
+
+	klog.Info("Controllers started")
+	<-stopCh
 }
 
-func main() {
-	// Create Kubernetes client
-	clientset := createClientSet()
-	// Test connection to cluster by listing namespaces
-	_, err := clientset.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		log.Fatalf("Failed to connect to cluster: %v", err)
+func buildConfig(kubeconfig string) (*rest.Config, error) {
+	// Try kubeconfig file first
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err == nil {
+		return config, nil
 	}
-	fmt.Println("Successfully connected to cluster")
+
+	// Fall back to in-cluster config
+	config, err = rest.InClusterConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to build config: %v", err)
+	}
+
+	return config, nil
 }
